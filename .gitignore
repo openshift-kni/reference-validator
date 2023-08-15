@@ -19,3 +19,12 @@
 
 # Go workspace file
 go.work
+
+# intellij
+.idea
+
+#macOS
+.DS_Store
+
+# config
+config.yaml
