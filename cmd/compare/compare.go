@@ -162,6 +162,7 @@ func yamlToUnstructured(file string) *unstructured.Unstructured {
 
 	if err := yaml.Unmarshal(yFile, &newUnstructured.Object); err != nil {
 		slog.Warn(fmt.Sprintf("could not convert %s to Unstructured, skipping", file))
+
 		return nil
 	}
 
