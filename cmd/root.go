@@ -2,14 +2,17 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+
+	"github.com/openshift-kni/reference-validator/cmd/compare"
+	"github.com/openshift-kni/reference-validator/cmd/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"os"
 )
 
 var cfgFile string
 
-// rootCmd represents the base command when called without any subcommands
+// rootCmd represents the base command when called without any subcommands.
 var rootCmd = &cobra.Command{
 	Use:   "reference-validator",
 	Short: "cli to validate k8s resources",
@@ -28,13 +31,15 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 
+	// add subcommands
+	rootCmd.AddCommand(compare.NewCmdCompare())
+	rootCmd.AddCommand(version.NewCmdVersion())
+
 	// global flags
-
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.reference-validator.yaml)")
-
 }
 
-// initConfig reads in config file and ENV variables if set using viper
+// initConfig reads in config file and ENV variables if set using viper.
 func initConfig() {
 	if cfgFile != "" {
 		// Use config file from the flag.

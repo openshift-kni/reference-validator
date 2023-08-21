@@ -1,4 +1,4 @@
-package cmd
+package version
 
 import (
 	"fmt"
@@ -6,16 +6,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// versionCmd shows the current version
-var versionCmd = &cobra.Command{
-	Use:   "version",
-	Short: "Reference-validator version",
-	Long:  `Reference-validator version`,
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("0.0.1")
-	},
-}
+// NewCmdVersion shows the current version.
+func NewCmdVersion() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "Reference-validator current version",
+		Long:  `Reference-validator current version`,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println("0.0.1")
+		},
+	}
 
-func init() {
-	rootCmd.AddCommand(versionCmd)
+	return cmd
 }
