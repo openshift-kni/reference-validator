@@ -61,7 +61,6 @@ linters:
     - nolintlint
     - nonamedreturns
     - nosprintfhostport
-    - paralleltest
     - predeclared
     - promlinter
     - reassign
@@ -74,7 +73,6 @@ linters:
     - tagliatelle
     - tenv
     - testableexamples
-    - testpackage
     - thelper
     - tparallel
     - typecheck
