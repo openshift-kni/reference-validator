@@ -4,6 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/hbollon/go-edlib"
 	"github.com/openshift-kni/reference-validator/pkg/util"
 	"github.com/spf13/cobra"
@@ -13,14 +19,9 @@ import (
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	k8sdiff "k8s.io/kubectl/pkg/cmd/diff"
 	"k8s.io/utils/exec"
-	"log"
-	"log/slog"
 	configurationPolicyv1 "open-cluster-management.io/config-policy-controller/api/v1"
 	policyv1 "open-cluster-management.io/governance-policy-propagator/api/v1"
-	"os"
-	"path/filepath"
 	"sigs.k8s.io/cli-utils/pkg/object"
-	"strings"
 )
 
 type compareOptions struct {
@@ -113,10 +114,10 @@ func (o compareOptions) run() {
 		os.Exit(1)
 	}
 
-	//resourcesMap
 	resourcesMap := getObjectMetaMap(uListResources)
 
 	slog.Info("----")
+
 	refMap := getObjectMetaMap(uListReference)
 
 	// CRs present in both lists
@@ -131,7 +132,6 @@ func (o compareOptions) run() {
 
 	// best case -- exact key
 	for _, iSrc := range intersectionOfSourceList {
-
 		curResources := resourcesMap[iSrc]
 		curReferences := refMap[iSrc]
 
@@ -144,47 +144,54 @@ func (o compareOptions) run() {
 	// todo: api version
 	// look for partial matches
 	slog.Info("attempting to find partial match")
-	for key, _ := range resourcesMap {
+
+	for key := range resourcesMap {
 		equivalentRefKey := findFuzzyMatch(key, refMap)
 		curResources := resourcesMap[key]
 		curReferences, ok := refMap[equivalentRefKey]
+
 		if !ok {
 			msg := fmt.Sprintf("could not find any match for %s", key.String())
 			slog.Warn(msg)
+
 			continue
 		}
+
 		exhaustiveDiff(curResources, curReferences)
 		// reduce the user provided the resources
 		delete(resourcesMap, key)
 	}
 
 	slog.Info("done")
-
 }
 
 func findFuzzyMatch(key object.ObjMetadata, refMap map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadata {
-
 	var allKeysString []string
 
-	for k, _ := range refMap {
+	for k := range refMap {
 		allKeysString = append(allKeysString, k.String())
 	}
+
 	matchWith := key.String()
 	threshold := 0.5
-	res, err := edlib.FuzzySearchSetThreshold(matchWith, allKeysString, 3, float32(threshold), edlib.Levenshtein)
+	numOfResults := 3
+
+	res, err := edlib.FuzzySearchSetThreshold(matchWith, allKeysString, numOfResults, float32(threshold), edlib.Levenshtein)
 	if err != nil {
 		return object.NilObjMetadata
-	} else {
-		fmt.Printf("with '%s' threshold --> Results: %s, for Key: %s\n", threshold, strings.Join(res, ", "), matchWith)
 	}
 
+	fmt.Printf("with '%f' threshold --> Results: %s, for Key: %s\n", float32(threshold), strings.Join(res, ", "), matchWith)
 	o, _ := object.ParseObjMetadata(res[0])
+
 	return o
 }
 
 func exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) {
 	temp := make(map[*bytes.Buffer]bool)
+
 	var diffB *bytes.Buffer
+
 	for _, res := range resources {
 		for _, ref := range references {
 			_, diffReportedPreviously := temp[diffB]
@@ -212,16 +219,15 @@ func diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructur
 		IOStreams: i,
 	}
 
-	resPath, _ := unstructuredToYaml(res)
-	refPath, _ := unstructuredToYaml(ref)
+	resPath := unstructuredToYaml(res)
+	refPath := unstructuredToYaml(ref)
 
 	err := diff.Run(resPath, refPath)
-	diff2.Run(resPath, refPath)
+	_ = diff2.Run(resPath, refPath)
 
 	if err == nil {
 		msg := fmt.Sprintf("res: %s and ref: %s are exact same", unstructuredToObjMeta(res).String(), unstructuredToObjMeta(ref).String())
 		slog.Info(msg)
-
 	}
 
 	os.RemoveAll(resPath)
@@ -230,34 +236,28 @@ func diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructur
 	return myOut
 }
 
-func unstructuredToYaml(u unstructured.Unstructured) (string, string) {
-	dir, err := os.MkdirTemp("", u.GetName())
+func unstructuredToYaml(uStructured unstructured.Unstructured) string {
+	dir, err := os.MkdirTemp("", uStructured.GetName())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	content, err := yaml.Marshal(u.UnstructuredContent())
+	content, err := yaml.Marshal(uStructured.UnstructuredContent())
 	if err != nil {
-		return "", ""
+		return ""
 	}
-	file := filepath.Join(dir, unstructuredToObjMeta(u).String())
-	if err := os.WriteFile(file, content, 0666); err != nil {
+
+	file := filepath.Join(dir, unstructuredToObjMeta(uStructured).String())
+	permission := 0o600
+
+	if err := os.WriteFile(file, content, os.FileMode(permission)); err != nil {
 		log.Fatal(err)
 	}
-	return file, string(content)
-}
 
-func diffOfSources(mapA, mapB map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
-	setA := objMetadataSetFromMap(mapA)
-	setB := objMetadataSetFromMap(mapB)
-
-	val := setA.Diff(setB)
-
-	return val
+	return file
 }
 
 func intersectionOfSources(mapA, mapB map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
-
 	setA := objMetadataSetFromMap(mapA)
 	setB := objMetadataSetFromMap(mapB)
 
@@ -270,18 +270,19 @@ func intersectionOfSources(mapA, mapB map[object.ObjMetadata][]unstructured.Unst
 	return val
 }
 
-// objMetadataSetFromMap constructs a set from a map
+// objMetadataSetFromMap constructs a set from a map.
 func objMetadataSetFromMap(mapA map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
 	setA := make(object.ObjMetadataSet, 0, len(mapA))
 	for f := range mapA {
 		setA = append(setA, f)
 	}
+
 	return setA
 }
 
 func getObjectMetaMap(uListUnstructured []unstructured.Unstructured) map[object.ObjMetadata][]unstructured.Unstructured {
-
 	curMap := make(map[object.ObjMetadata][]unstructured.Unstructured)
+
 	for _, u := range uListUnstructured {
 		key := unstructuredToObjMeta(u)
 		curMap[key] = append(curMap[key], u)
@@ -292,13 +293,13 @@ func getObjectMetaMap(uListUnstructured []unstructured.Unstructured) map[object.
 
 // UnstructuredToObjMeta extracts the object metadata information from a unstructured.Unstructured and returns it as ObjMetadata.
 func unstructuredToObjMeta(obj unstructured.Unstructured) object.ObjMetadata {
-
-	id := object.ObjMetadata{
+	newID := object.ObjMetadata{
 		Namespace: obj.GetNamespace(),
 		Name:      obj.GetName(),
 		GroupKind: obj.GetObjectKind().GroupVersionKind().GroupKind(),
 	}
-	return id
+
+	return newID
 }
 
 func getResourceFromPolicyIfAny(uList []unstructured.Unstructured) []unstructured.Unstructured {
@@ -399,7 +400,6 @@ func getObjectTemplates(p policyv1.Policy) []unstructured.Unstructured {
 				continue
 			}
 
-			//slog.Info(fmt.Sprintf("found CR %s", customResource.GetName()))
 			objT = append(objT, *customResource)
 		}
 	}
