@@ -8,7 +8,6 @@ linters:
     - contextcheck
     - cyclop
     - decorder
-    - dogsled
     - dupl
     - dupword
     - durationcheck
@@ -79,10 +78,8 @@ linters:
     - unparam
     - unused
     - usestdlibvars
-    - varnamelen
     - wastedassign
     - whitespace
-    - wrapcheck
     - wsl
     - zerologlint
 

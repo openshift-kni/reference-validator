@@ -1,7 +1,6 @@
 package compare
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -28,6 +27,7 @@ type compareOptions struct {
 	ReferenceDirs  []string
 	ResourceDirs   []string
 	ExactMatchOnly bool
+	Diff           *k8sdiff.DiffProgram
 }
 
 func NewCmdCompare() *cobra.Command {
@@ -89,17 +89,11 @@ func (o compareOptions) validate() error {
 func (o compareOptions) run() {
 	slog.Info("preparing resources")
 
-	var uListResources []unstructured.Unstructured
-
-	uListResources = readK8sResourcesFromDir(o.ResourceDirs, uListResources)
-	uListResources = getResourceFromPolicyIfAny(uListResources)
+	uListResources := readK8sResourcesFromDir(o.ResourceDirs)
 
 	slog.Info("preparing reference")
 
-	var uListReference []unstructured.Unstructured
-
-	uListReference = readK8sResourcesFromDir(o.ReferenceDirs, uListReference)
-	uListReference = getResourceFromPolicyIfAny(uListReference)
+	uListReference := readK8sResourcesFromDir(o.ReferenceDirs)
 
 	// short circuit. Useful for ACM vs ZTP cases
 	eMatch := equalUnstructuredList(uListResources, uListReference)
@@ -123,19 +117,12 @@ func (o compareOptions) run() {
 	// CRs present in both lists
 	intersectionOfSourceList := intersectionOfSources(resourcesMap, refMap)
 
-	// what reference contains but missing in input
-	/*dSources := diffOfSources(refMap, resourcesMap)
-	slog.Info("not using the following")
-	for _, d := range dSources {
-		slog.Warn(d.String())
-	}*/
-
 	// best case -- exact key
 	for _, iSrc := range intersectionOfSourceList {
 		curResources := resourcesMap[iSrc]
 		curReferences := refMap[iSrc]
 
-		exhaustiveDiff(curResources, curReferences)
+		o.exhaustiveDiff(curResources, curReferences)
 
 		// reduce the user provided the resources
 		delete(resourcesMap, iSrc)
@@ -157,10 +144,12 @@ func (o compareOptions) run() {
 			continue
 		}
 
-		exhaustiveDiff(curResources, curReferences)
+		o.exhaustiveDiff(curResources, curReferences)
 		// reduce the user provided the resources
 		delete(resourcesMap, key)
 	}
+
+	// todo: files that were in reference but no match
 
 	slog.Info("done")
 }
@@ -187,45 +176,28 @@ func findFuzzyMatch(key object.ObjMetadata, refMap map[object.ObjMetadata][]unst
 	return o
 }
 
-func exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) {
-	temp := make(map[*bytes.Buffer]bool)
-
-	var diffB *bytes.Buffer
-
+func (o compareOptions) exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) {
 	for _, res := range resources {
 		for _, ref := range references {
-			_, diffReportedPreviously := temp[diffB]
-			if !diffReportedPreviously {
-				diffB = diffUnstructured(res, ref)
-				temp[diffB] = true
-			}
-			// todo: add more metadata e.g yaml file name
-			msg := fmt.Sprintf("seen this diff before, skipping:  %s ", unstructuredToObjMeta(res).String())
-			slog.Info(msg)
+			_ = o.diffUnstructured(res, ref)
 		}
 	}
 }
 
-func diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructured) *bytes.Buffer {
-	// move this outside
-	diff := k8sdiff.DiffProgram{
-		Exec:      exec.New(),
-		IOStreams: genericiooptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr},
-	}
-
-	i, _, myOut, _ := genericiooptions.NewTestIOStreams()
-	diff2 := k8sdiff.DiffProgram{
-		Exec:      exec.New(),
-		IOStreams: i,
+func (o compareOptions) diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructured) error {
+	if o.Diff == nil {
+		o.Diff = &k8sdiff.DiffProgram{
+			Exec:      exec.New(),
+			IOStreams: genericiooptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr},
+		}
 	}
 
 	resPath := unstructuredToYaml(res)
 	refPath := unstructuredToYaml(ref)
 
-	err := diff.Run(resPath, refPath)
-	_ = diff2.Run(resPath, refPath)
+	diffFound := o.Diff.Run(resPath, refPath)
 
-	if err == nil {
+	if diffFound == nil {
 		msg := fmt.Sprintf("res: %s and ref: %s are exact same", unstructuredToObjMeta(res).String(), unstructuredToObjMeta(ref).String())
 		slog.Info(msg)
 	}
@@ -233,7 +205,7 @@ func diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructur
 	os.RemoveAll(resPath)
 	os.RemoveAll(refPath)
 
-	return myOut
+	return diffFound
 }
 
 func unstructuredToYaml(uStructured unstructured.Unstructured) string {
@@ -302,44 +274,57 @@ func unstructuredToObjMeta(obj unstructured.Unstructured) object.ObjMetadata {
 	return newID
 }
 
-func getResourceFromPolicyIfAny(uList []unstructured.Unstructured) []unstructured.Unstructured {
+func getResourcesFromPolicyIfAny(curUnstructured unstructured.Unstructured) []unstructured.Unstructured {
 	// Extract the main CR if policy
 	var uListWithoutP []unstructured.Unstructured
 
-	for _, curUnstructured := range uList {
-		if curUnstructured.GetKind() == "Policy" {
-			policy := policyv1.Policy{}
+	if curUnstructured.GetKind() == "Policy" {
+		policy := policyv1.Policy{}
 
-			err := runtime.DefaultUnstructuredConverter.FromUnstructured(curUnstructured.Object, &policy)
-			if err != nil {
-				slog.Warn("invalid Policy CR")
+		err := runtime.DefaultUnstructuredConverter.FromUnstructured(curUnstructured.Object, &policy)
+		if err != nil {
+			slog.Warn("invalid Policy CR")
 
-				continue
-			}
-
-			uListWithoutP = append(uListWithoutP, getObjectTemplates(policy)...)
-
-			continue
+			return nil
 		}
 
-		uListWithoutP = append(uListWithoutP, curUnstructured)
+		uListWithoutP = append(uListWithoutP, getObjectTemplates(policy)...)
 	}
+
+	uListWithoutP = append(uListWithoutP, curUnstructured)
 
 	return uListWithoutP
 }
 
-func readK8sResourcesFromDir(curDir []string, uList []unstructured.Unstructured) []unstructured.Unstructured {
+func readK8sResourcesFromDir(curDir []string) []unstructured.Unstructured {
+	removeDuplicate := make(map[string]string)
+
+	var finalList []unstructured.Unstructured
+
 	for _, d := range curDir {
 		files, _ := util.GetFileNames(d)
-		for _, f := range files {
-			u := yamlToUnstructured(f)
-			if u != nil {
-				uList = append(uList, *u)
+		for _, curFile := range files {
+			u := yamlToUnstructured(curFile)
+			uList := getResourcesFromPolicyIfAny(*u)
+
+			for _, curU := range uList {
+				key, _ := curU.MarshalJSON()
+
+				if seenBeforeFilePath, seenBefore := removeDuplicate[string(key)]; seenBefore {
+					msg := fmt.Sprintf("previously seen full or partial content of %s in %s", curFile, seenBeforeFilePath)
+					slog.Warn(msg)
+
+					continue
+				}
+
+				removeDuplicate[string(key)] = curFile
+
+				finalList = append(finalList, curU)
 			}
 		}
 	}
 
-	return uList
+	return finalList
 }
 
 func yamlToUnstructured(file string) *unstructured.Unstructured {
