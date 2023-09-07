@@ -1,7 +1,6 @@
 package compare
 
 import (
-	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -78,6 +77,29 @@ metadata:
   name: cnfdf28
 `
 
+	resListCR1 := `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cnfdf28
+  labels:
+    name: cnfdf28
+  list:
+    - one 
+    - two
+`
+	refListCR1 := `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cnfdf28
+  labels:
+    name: cnfdf28
+  list:
+    - one 
+    - five
+`
+
 	i, _, _, _ := genericiooptions.NewTestIOStreams()
 
 	type fields struct {
@@ -90,13 +112,13 @@ metadata:
 	}
 
 	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		isDiff error
+		name     string
+		fields   fields
+		args     args
+		wantDiff bool
 	}{
 		{
-			name: "A and b identical except for field in different order - no diff expected",
+			name: "A and b identical except for field in different order",
 			fields: fields{
 				Diff: &k8sdiff.DiffProgram{
 					Exec:      exec.New(),
@@ -107,7 +129,35 @@ metadata:
 				res: *yamlToUnstructured(mustGetTestFilePath(t, resCR1)),
 				ref: *yamlToUnstructured(mustGetTestFilePath(t, refCR1)),
 			},
-			isDiff: nil,
+			wantDiff: false,
+		},
+		{
+			name: "A and b identical except list entries are different",
+			fields: fields{
+				Diff: &k8sdiff.DiffProgram{
+					Exec:      exec.New(),
+					IOStreams: i,
+				},
+			},
+			args: args{
+				res: *yamlToUnstructured(mustGetTestFilePath(t, resListCR1)),
+				ref: *yamlToUnstructured(mustGetTestFilePath(t, refListCR1)),
+			},
+			wantDiff: true,
+		},
+		{
+			name: "A and b identical (including list)",
+			fields: fields{
+				Diff: &k8sdiff.DiffProgram{
+					Exec:      exec.New(),
+					IOStreams: i,
+				},
+			},
+			args: args{
+				res: *yamlToUnstructured(mustGetTestFilePath(t, resListCR1)),
+				ref: *yamlToUnstructured(mustGetTestFilePath(t, resListCR1)),
+			},
+			wantDiff: false,
 		},
 	}
 	for _, tt := range tests {
@@ -116,7 +166,8 @@ metadata:
 				Diff: tt.fields.Diff,
 			}
 			isDiff := o.diffUnstructured(tt.args.res, tt.args.ref)
-			if !errors.Is(isDiff, tt.isDiff) {
+
+			if !tt.wantDiff && isDiff != nil {
 				t.Errorf(isDiff.Error())
 
 				return
