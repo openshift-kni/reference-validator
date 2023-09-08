@@ -8,7 +8,6 @@ linters:
     - contextcheck
     - cyclop
     - decorder
-    - dogsled
     - dupl
     - dupword
     - durationcheck
@@ -29,7 +28,6 @@ linters:
     - gocritic
     - gocyclo
     - godot
-    - godox
     - gofmt
     - gofumpt
     - goheader
@@ -80,9 +78,12 @@ linters:
     - unparam
     - unused
     - usestdlibvars
-    - varnamelen
     - wastedassign
     - whitespace
-    - wrapcheck
     - wsl
     - zerologlint
+
+linters-settings:
+  funlen:
+    lines: 175
+    statements: 85

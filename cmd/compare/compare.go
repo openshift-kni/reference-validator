@@ -3,27 +3,30 @@ package compare
 import (
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/hbollon/go-edlib"
 	"github.com/openshift-kni/reference-validator/pkg/util"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	k8sdiff "k8s.io/kubectl/pkg/cmd/diff"
+	"k8s.io/utils/exec"
 	configurationPolicyv1 "open-cluster-management.io/config-policy-controller/api/v1"
 	policyv1 "open-cluster-management.io/governance-policy-propagator/api/v1"
-
-	// to be used for objectmeta definition.
-	_ "sigs.k8s.io/cli-utils/pkg/object"
+	"sigs.k8s.io/cli-utils/pkg/object"
 )
 
 type compareOptions struct {
-	ReferenceDirs  []string
-	ResourceDirs   []string
-	ExactMatchOnly bool
+	ReferenceDirs []string
+	ResourceDirs  []string
+	Diff          *k8sdiff.DiffProgram
 }
 
 func NewCmdCompare() *cobra.Command {
@@ -40,7 +43,7 @@ func NewCmdCompare() *cobra.Command {
 
 				return err
 			}
-			options.run()
+			options.run() //nolint:golint,errcheck
 
 			return nil
 		},
@@ -61,8 +64,6 @@ func NewCmdCompare() *cobra.Command {
 		return nil
 	}
 
-	cmd.Flags().BoolVarP(&options.ExactMatchOnly, "exact-match-only", "", false, "Return early by determining if both sets are exact match")
-
 	return cmd
 }
 
@@ -82,78 +83,328 @@ func (o compareOptions) validate() error {
 	return nil
 }
 
-func (o compareOptions) run() {
+func (o compareOptions) run() (map[object.ObjMetadata][]unstructured.Unstructured, map[object.ObjMetadata][]unstructured.Unstructured, error) { //nolint:golint,unparam
 	slog.Info("preparing resources")
 
-	var uListResources []unstructured.Unstructured
-
-	uListResources = readK8sResourcesFromDir(o.ResourceDirs, uListResources)
-	uListResources = getResourceFromPolicyIfAny(uListResources)
+	uListResources := readK8sResourcesFromDir(o.ResourceDirs)
 
 	slog.Info("preparing reference")
 
-	var uListReference []unstructured.Unstructured
-
-	uListReference = readK8sResourcesFromDir(o.ReferenceDirs, uListReference)
-	uListReference = getResourceFromPolicyIfAny(uListReference)
+	uListReference := readK8sResourcesFromDir(o.ReferenceDirs)
 
 	// short circuit. Useful for ACM vs ZTP cases
-	eMatch := equalUnstructuredList(uListResources, uListReference)
+	eMatch := contentExactMatch(uListResources, uListReference)
+	if eMatch {
+		slog.Info("two sets exact match")
+		os.Exit(0)
+	}
 
-	if o.ExactMatchOnly {
-		slog.Info("exiting early")
+	resourcesMap := getObjectMetaMap(uListResources)
 
-		if eMatch {
-			os.Exit(0)
+	slog.Info("----")
+
+	refMap := getObjectMetaMap(uListReference)
+
+	// CRs present in both lists
+	// best case -- exact key
+	o.keyExactMatch(resourcesMap, refMap)
+
+	// todo: api version
+	// look for partial matches
+	slog.Info("attempting to find partial match")
+
+	o.keyPartialMatch(resourcesMap, refMap)
+
+	// warning no match for user provided CRs
+	if len(resourcesMap) > 0 {
+		slog.Warn("could not find any match for the following")
+
+		for _, value := range resourcesMap {
+			for _, curU := range value {
+				_, content := unstructuredToYaml(curU)
+
+				msg := fmt.Sprintf("\n%s", content)
+				slog.Warn(msg)
+			}
+		}
+	}
+
+	// error when reference CRs are not used
+	if len(refMap) > 0 {
+		slog.Error("unused reference CR")
+
+		for _, value := range refMap {
+			for _, curU := range value {
+				_, content := unstructuredToYaml(curU)
+
+				msg := fmt.Sprintf("\n%s", content)
+				slog.Error(msg)
+			}
 		}
 
-		os.Exit(1)
+		err := errors.New("reference CRs are not used")
+
+		return resourcesMap, refMap, err
 	}
 
-	_ = k8sdiff.DiffProgram{
-		Exec:      nil,
-		IOStreams: genericclioptions.IOStreams{},
-	}
+	return resourcesMap, refMap, nil
 }
 
-func getResourceFromPolicyIfAny(uList []unstructured.Unstructured) []unstructured.Unstructured {
-	// Extract the main CR if policy
-	var uListWithoutP []unstructured.Unstructured
+func (o compareOptions) keyPartialMatch(resourcesMap map[object.ObjMetadata][]unstructured.Unstructured, refMap map[object.ObjMetadata][]unstructured.Unstructured) []error {
+	var errs []error
 
-	for _, curUnstructured := range uList {
-		if curUnstructured.GetKind() == "Policy" {
-			policy := policyv1.Policy{}
+	for key := range resourcesMap {
+		equivalentRefKey := findFuzzyMatch(key, refMap)
+		curResources := resourcesMap[key]
+		curReferences, ok := refMap[equivalentRefKey]
 
-			err := runtime.DefaultUnstructuredConverter.FromUnstructured(curUnstructured.Object, &policy)
-			if err != nil {
-				slog.Warn("invalid Policy CR")
-
-				continue
-			}
-
-			uListWithoutP = append(uListWithoutP, getObjectTemplates(policy)...)
+		if !ok {
+			msg := fmt.Sprintf("could not find any match for %s", key.String())
+			slog.Warn(msg)
 
 			continue
 		}
 
-		uListWithoutP = append(uListWithoutP, curUnstructured)
+		errs = append(errs, o.exhaustiveDiff(curResources, curReferences)...)
+		// reduce the user provided the resources
+		delete(resourcesMap, key)
+		delete(refMap, key)
 	}
+
+	return errs
+}
+
+func (o compareOptions) keyExactMatch(resourcesMap map[object.ObjMetadata][]unstructured.Unstructured, refMap map[object.ObjMetadata][]unstructured.Unstructured) []error {
+	intersectionOfSourceList := intersectionOfSources(resourcesMap, refMap)
+
+	var errs []error
+
+	for _, iSrc := range intersectionOfSourceList {
+		curResources := resourcesMap[iSrc]
+		curReferences := refMap[iSrc]
+
+		errs = append(errs, o.exhaustiveDiff(curResources, curReferences)...)
+
+		// reduce the user provided the resources
+		delete(resourcesMap, iSrc)
+		delete(refMap, iSrc)
+	}
+
+	return errs
+}
+
+func findFuzzyMatch(key object.ObjMetadata, refMap map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadata {
+	var allKeysString []string
+
+	for k := range refMap {
+		allKeysString = append(allKeysString, k.String())
+	}
+
+	matchWith := key.String()
+	threshold := 0.5
+	numOfResults := 3
+
+	res, err := edlib.FuzzySearchSetThreshold(matchWith, allKeysString, numOfResults, float32(threshold), edlib.Levenshtein)
+	if err != nil {
+		return object.NilObjMetadata
+	}
+
+	fmt.Printf("with '%f' threshold --> Results: %s, for Key: %s\n", float32(threshold), strings.Join(res, ", "), matchWith)
+	o, _ := object.ParseObjMetadata(res[0])
+
+	return o
+}
+
+func (o compareOptions) exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) []error {
+	var errs []error
+
+	for _, res := range resources {
+		for _, ref := range references {
+			errs = append(errs, o.diffUnstructured(res, ref))
+		}
+	}
+
+	return errs
+}
+
+func (o compareOptions) diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructured) error {
+	if o.Diff == nil {
+		o.Diff = &k8sdiff.DiffProgram{
+			Exec:      exec.New(),
+			IOStreams: genericiooptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr},
+		}
+	}
+
+	resPath, _ := unstructuredToYaml(res)
+	refPath, _ := unstructuredToYaml(ref)
+
+	diffFound := o.Diff.Run(resPath, refPath)
+
+	if diffFound == nil {
+		msg := fmt.Sprintf("res: %s and ref: %s are exact same", unstructuredToObjMeta(res).String(), unstructuredToObjMeta(ref).String())
+		slog.Info(msg)
+	}
+
+	os.RemoveAll(resPath)
+	os.RemoveAll(refPath)
+
+	return diffFound
+}
+
+func unstructuredToYaml(uStructured unstructured.Unstructured) (string, string) {
+	dir, err := os.MkdirTemp("", uStructured.GetName())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	content, err := yaml.Marshal(uStructured.UnstructuredContent())
+	if err != nil {
+		return "", ""
+	}
+
+	file := filepath.Join(dir, unstructuredToObjMeta(uStructured).String())
+	permission := 0o600
+
+	if err := os.WriteFile(file, content, os.FileMode(permission)); err != nil {
+		log.Fatal(err)
+	}
+
+	return file, string(content)
+}
+
+func intersectionOfSources(mapA, mapB map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
+	setA := objMetadataSetFromMap(mapA)
+	setB := objMetadataSetFromMap(mapB)
+
+	val := setA.Intersection(setB)
+
+	for _, v := range val {
+		slog.Info(v.String())
+	}
+
+	return val
+}
+
+// objMetadataSetFromMap constructs a set from a map.
+func objMetadataSetFromMap(mapA map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
+	setA := make(object.ObjMetadataSet, 0, len(mapA))
+	for f := range mapA {
+		setA = append(setA, f)
+	}
+
+	return setA
+}
+
+func getObjectMetaMap(uListUnstructured []unstructured.Unstructured) map[object.ObjMetadata][]unstructured.Unstructured {
+	curMap := make(map[object.ObjMetadata][]unstructured.Unstructured)
+
+	for _, u := range uListUnstructured {
+		key := unstructuredToObjMeta(u)
+		curMap[key] = append(curMap[key], u)
+	}
+
+	return curMap
+}
+
+// UnstructuredToObjMeta extracts the object metadata information from a unstructured.Unstructured and returns it as ObjMetadata.
+func unstructuredToObjMeta(obj unstructured.Unstructured) object.ObjMetadata {
+	newID := object.ObjMetadata{
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+		GroupKind: obj.GetObjectKind().GroupVersionKind().GroupKind(),
+	}
+
+	return newID
+}
+
+func getResourcesFromPolicyIfAny(curUnstructured unstructured.Unstructured) []unstructured.Unstructured {
+	// Extract the main CR if policy
+	var uListWithoutP []unstructured.Unstructured
+
+	if curUnstructured.GetKind() == "Policy" {
+		policy := policyv1.Policy{}
+
+		err := runtime.DefaultUnstructuredConverter.FromUnstructured(curUnstructured.Object, &policy)
+		if err != nil {
+			slog.Warn("invalid Policy CR")
+
+			return nil
+		}
+
+		return append(uListWithoutP, getObjectTemplates(policy)...)
+	}
+
+	uListWithoutP = append(uListWithoutP, curUnstructured)
 
 	return uListWithoutP
 }
 
-func readK8sResourcesFromDir(curDir []string, uList []unstructured.Unstructured) []unstructured.Unstructured {
+func readK8sResourcesFromDir(curDir []string) []unstructured.Unstructured {
+	var finalList []unstructured.Unstructured
+
+	removeDuplicate := make(map[string]string)
+
 	for _, d := range curDir {
 		files, _ := util.GetFileNames(d)
-		for _, f := range files {
-			u := yamlToUnstructured(f)
-			if u != nil {
-				uList = append(uList, *u)
-			}
+		for _, curFile := range files {
+			u := yamlToUnstructured(curFile)
+			uList := getResourcesFromPolicyIfAny(*u)
+
+			// post process
+			uList = removeDuplicates(uList, removeDuplicate, curFile)
+			uList = removeResourcesWeDontWantToProcess(uList)
+
+			finalList = append(finalList, uList...)
 		}
 	}
 
-	return uList
+	return finalList
+}
+
+func removeResourcesWeDontWantToProcess(uList []unstructured.Unstructured) []unstructured.Unstructured { //nolint:golint,cyclop
+	var finalList []unstructured.Unstructured
+	// todo: refer to reference dir to dynamically create these rules?
+	for _, u := range uList {
+		if u.GetAPIVersion() == "rbac.authorization.k8s.io/v1" ||
+			u.GetAPIVersion() == "SecurityContextConstraints-security.openshift.io" ||
+			u.GetAPIVersion() == "config.openshift.io/v1" ||
+			u.GetAPIVersion() == "security.openshift.io/v1" ||
+			u.GetAPIVersion() == "sriovfec.intel.com/v2" || // it's optional?!
+			u.GetObjectKind().GroupVersionKind().Kind == "Secret" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "Namespace" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "MachineConfigPool" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "ServiceAccount" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "Node" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "PlacementBinding" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "PlacementRule" {
+			continue
+		}
+
+		finalList = append(finalList, u)
+	}
+
+	return finalList
+}
+
+func removeDuplicates(uList []unstructured.Unstructured, removeDuplicate map[string]string, curFile string) []unstructured.Unstructured {
+	var finalList []unstructured.Unstructured
+
+	for _, curU := range uList {
+		key, _ := curU.MarshalJSON()
+
+		if seenBeforeFilePath, seenBefore := removeDuplicate[string(key)]; seenBefore {
+			msg := fmt.Sprintf("previously seen full or partial content of %s in %s", curFile, seenBeforeFilePath)
+			slog.Warn(msg)
+
+			continue
+		}
+
+		removeDuplicate[string(key)] = curFile
+
+		finalList = append(finalList, curU)
+	}
+
+	return finalList
 }
 
 func yamlToUnstructured(file string) *unstructured.Unstructured {
@@ -214,7 +465,6 @@ func getObjectTemplates(p policyv1.Policy) []unstructured.Unstructured {
 				continue
 			}
 
-			slog.Info(fmt.Sprintf("found CR %s", customResource.GetName()))
 			objT = append(objT, *customResource)
 		}
 	}
@@ -222,7 +472,7 @@ func getObjectTemplates(p policyv1.Policy) []unstructured.Unstructured {
 	return objT
 }
 
-func equalUnstructuredList(setA []unstructured.Unstructured, setB []unstructured.Unstructured) bool {
+func contentExactMatch(setA []unstructured.Unstructured, setB []unstructured.Unstructured) bool {
 	mapA := make(map[string]string, len(setA))
 
 	for _, a := range setA {

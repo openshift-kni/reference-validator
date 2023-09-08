@@ -5,12 +5,14 @@ go 1.21
 replace k8s.io/client-go => k8s.io/client-go v0.28.0
 
 require (
+	github.com/hbollon/go-edlib v1.6.0
 	github.com/spf13/cobra v1.7.0
 	github.com/spf13/viper v1.16.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/apimachinery v0.28.0
 	k8s.io/cli-runtime v0.28.0
 	k8s.io/kubectl v0.28.0
+	k8s.io/utils v0.0.0-20230726121419-3b25d923346b
 	open-cluster-management.io/config-policy-controller v0.11.0
 	open-cluster-management.io/governance-policy-propagator v0.11.0
 	sigs.k8s.io/cli-utils v0.35.0
@@ -86,7 +88,6 @@ require (
 	k8s.io/component-base v0.28.0 // indirect
 	k8s.io/klog/v2 v2.100.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20230816210353-14e408962443 // indirect
-	k8s.io/utils v0.0.0-20230726121419-3b25d923346b // indirect
 	open-cluster-management.io/multicloud-operators-subscription v0.11.0 // indirect
 	sigs.k8s.io/controller-runtime v0.15.1 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
