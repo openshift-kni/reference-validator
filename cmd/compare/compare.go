@@ -24,10 +24,9 @@ import (
 )
 
 type compareOptions struct {
-	ReferenceDirs  []string
-	ResourceDirs   []string
-	ExactMatchOnly bool
-	Diff           *k8sdiff.DiffProgram
+	ReferenceDirs []string
+	ResourceDirs  []string
+	Diff          *k8sdiff.DiffProgram
 }
 
 func NewCmdCompare() *cobra.Command {
@@ -44,7 +43,7 @@ func NewCmdCompare() *cobra.Command {
 
 				return err
 			}
-			options.run()
+			options.run() //nolint:golint,errcheck
 
 			return nil
 		},
@@ -65,8 +64,6 @@ func NewCmdCompare() *cobra.Command {
 		return nil
 	}
 
-	cmd.Flags().BoolVarP(&options.ExactMatchOnly, "exact-match-only", "", false, "Return early by determining if both sets are exact match")
-
 	return cmd
 }
 
@@ -86,7 +83,7 @@ func (o compareOptions) validate() error {
 	return nil
 }
 
-func (o compareOptions) run() {
+func (o compareOptions) run() (map[object.ObjMetadata][]unstructured.Unstructured, map[object.ObjMetadata][]unstructured.Unstructured, error) { //nolint:golint,unparam
 	slog.Info("preparing resources")
 
 	uListResources := readK8sResourcesFromDir(o.ResourceDirs)
@@ -96,16 +93,10 @@ func (o compareOptions) run() {
 	uListReference := readK8sResourcesFromDir(o.ReferenceDirs)
 
 	// short circuit. Useful for ACM vs ZTP cases
-	eMatch := equalUnstructuredList(uListResources, uListReference)
-
-	if o.ExactMatchOnly {
-		slog.Info("exiting early")
-
-		if eMatch {
-			os.Exit(0)
-		}
-
-		os.Exit(1)
+	eMatch := contentExactMatch(uListResources, uListReference)
+	if eMatch {
+		slog.Info("two sets exact match")
+		os.Exit(0)
 	}
 
 	resourcesMap := getObjectMetaMap(uListResources)
@@ -115,22 +106,52 @@ func (o compareOptions) run() {
 	refMap := getObjectMetaMap(uListReference)
 
 	// CRs present in both lists
-	intersectionOfSourceList := intersectionOfSources(resourcesMap, refMap)
-
 	// best case -- exact key
-	for _, iSrc := range intersectionOfSourceList {
-		curResources := resourcesMap[iSrc]
-		curReferences := refMap[iSrc]
-
-		o.exhaustiveDiff(curResources, curReferences)
-
-		// reduce the user provided the resources
-		delete(resourcesMap, iSrc)
-	}
+	o.keyExactMatch(resourcesMap, refMap)
 
 	// todo: api version
 	// look for partial matches
 	slog.Info("attempting to find partial match")
+
+	o.keyPartialMatch(resourcesMap, refMap)
+
+	// warning no match for user provided CRs
+	if len(resourcesMap) > 0 {
+		slog.Warn("could not find any match for the following")
+
+		for _, value := range resourcesMap {
+			for _, curU := range value {
+				_, content := unstructuredToYaml(curU)
+
+				msg := fmt.Sprintf("\n%s", content)
+				slog.Warn(msg)
+			}
+		}
+	}
+
+	// error when reference CRs are not used
+	if len(refMap) > 0 {
+		slog.Error("unused reference CR")
+
+		for _, value := range refMap {
+			for _, curU := range value {
+				_, content := unstructuredToYaml(curU)
+
+				msg := fmt.Sprintf("\n%s", content)
+				slog.Error(msg)
+			}
+		}
+
+		err := errors.New("reference CRs are not used")
+
+		return resourcesMap, refMap, err
+	}
+
+	return resourcesMap, refMap, nil
+}
+
+func (o compareOptions) keyPartialMatch(resourcesMap map[object.ObjMetadata][]unstructured.Unstructured, refMap map[object.ObjMetadata][]unstructured.Unstructured) []error {
+	var errs []error
 
 	for key := range resourcesMap {
 		equivalentRefKey := findFuzzyMatch(key, refMap)
@@ -144,14 +165,32 @@ func (o compareOptions) run() {
 			continue
 		}
 
-		o.exhaustiveDiff(curResources, curReferences)
+		errs = append(errs, o.exhaustiveDiff(curResources, curReferences)...)
 		// reduce the user provided the resources
 		delete(resourcesMap, key)
+		delete(refMap, key)
 	}
 
-	// todo: files that were in reference but no match
+	return errs
+}
 
-	slog.Info("done")
+func (o compareOptions) keyExactMatch(resourcesMap map[object.ObjMetadata][]unstructured.Unstructured, refMap map[object.ObjMetadata][]unstructured.Unstructured) []error {
+	intersectionOfSourceList := intersectionOfSources(resourcesMap, refMap)
+
+	var errs []error
+
+	for _, iSrc := range intersectionOfSourceList {
+		curResources := resourcesMap[iSrc]
+		curReferences := refMap[iSrc]
+
+		errs = append(errs, o.exhaustiveDiff(curResources, curReferences)...)
+
+		// reduce the user provided the resources
+		delete(resourcesMap, iSrc)
+		delete(refMap, iSrc)
+	}
+
+	return errs
 }
 
 func findFuzzyMatch(key object.ObjMetadata, refMap map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadata {
@@ -176,12 +215,16 @@ func findFuzzyMatch(key object.ObjMetadata, refMap map[object.ObjMetadata][]unst
 	return o
 }
 
-func (o compareOptions) exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) {
+func (o compareOptions) exhaustiveDiff(resources []unstructured.Unstructured, references []unstructured.Unstructured) []error {
+	var errs []error
+
 	for _, res := range resources {
 		for _, ref := range references {
-			_ = o.diffUnstructured(res, ref)
+			errs = append(errs, o.diffUnstructured(res, ref))
 		}
 	}
+
+	return errs
 }
 
 func (o compareOptions) diffUnstructured(res unstructured.Unstructured, ref unstructured.Unstructured) error {
@@ -192,8 +235,8 @@ func (o compareOptions) diffUnstructured(res unstructured.Unstructured, ref unst
 		}
 	}
 
-	resPath := unstructuredToYaml(res)
-	refPath := unstructuredToYaml(ref)
+	resPath, _ := unstructuredToYaml(res)
+	refPath, _ := unstructuredToYaml(ref)
 
 	diffFound := o.Diff.Run(resPath, refPath)
 
@@ -208,7 +251,7 @@ func (o compareOptions) diffUnstructured(res unstructured.Unstructured, ref unst
 	return diffFound
 }
 
-func unstructuredToYaml(uStructured unstructured.Unstructured) string {
+func unstructuredToYaml(uStructured unstructured.Unstructured) (string, string) {
 	dir, err := os.MkdirTemp("", uStructured.GetName())
 	if err != nil {
 		log.Fatal(err)
@@ -216,7 +259,7 @@ func unstructuredToYaml(uStructured unstructured.Unstructured) string {
 
 	content, err := yaml.Marshal(uStructured.UnstructuredContent())
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	file := filepath.Join(dir, unstructuredToObjMeta(uStructured).String())
@@ -226,7 +269,7 @@ func unstructuredToYaml(uStructured unstructured.Unstructured) string {
 		log.Fatal(err)
 	}
 
-	return file
+	return file, string(content)
 }
 
 func intersectionOfSources(mapA, mapB map[object.ObjMetadata][]unstructured.Unstructured) object.ObjMetadataSet {
@@ -288,7 +331,7 @@ func getResourcesFromPolicyIfAny(curUnstructured unstructured.Unstructured) []un
 			return nil
 		}
 
-		uListWithoutP = append(uListWithoutP, getObjectTemplates(policy)...)
+		return append(uListWithoutP, getObjectTemplates(policy)...)
 	}
 
 	uListWithoutP = append(uListWithoutP, curUnstructured)
@@ -297,9 +340,9 @@ func getResourcesFromPolicyIfAny(curUnstructured unstructured.Unstructured) []un
 }
 
 func readK8sResourcesFromDir(curDir []string) []unstructured.Unstructured {
-	removeDuplicate := make(map[string]string)
-
 	var finalList []unstructured.Unstructured
+
+	removeDuplicate := make(map[string]string)
 
 	for _, d := range curDir {
 		files, _ := util.GetFileNames(d)
@@ -307,21 +350,58 @@ func readK8sResourcesFromDir(curDir []string) []unstructured.Unstructured {
 			u := yamlToUnstructured(curFile)
 			uList := getResourcesFromPolicyIfAny(*u)
 
-			for _, curU := range uList {
-				key, _ := curU.MarshalJSON()
+			// post process
+			uList = removeDuplicates(uList, removeDuplicate, curFile)
+			uList = removeResourcesWeDontWantToProcess(uList)
 
-				if seenBeforeFilePath, seenBefore := removeDuplicate[string(key)]; seenBefore {
-					msg := fmt.Sprintf("previously seen full or partial content of %s in %s", curFile, seenBeforeFilePath)
-					slog.Warn(msg)
-
-					continue
-				}
-
-				removeDuplicate[string(key)] = curFile
-
-				finalList = append(finalList, curU)
-			}
+			finalList = append(finalList, uList...)
 		}
+	}
+
+	return finalList
+}
+
+func removeResourcesWeDontWantToProcess(uList []unstructured.Unstructured) []unstructured.Unstructured { //nolint:golint,cyclop
+	var finalList []unstructured.Unstructured
+	// todo: refer to reference dir to dynamically create these rules?
+	for _, u := range uList {
+		if u.GetAPIVersion() == "rbac.authorization.k8s.io/v1" ||
+			u.GetAPIVersion() == "SecurityContextConstraints-security.openshift.io" ||
+			u.GetAPIVersion() == "config.openshift.io/v1" ||
+			u.GetAPIVersion() == "security.openshift.io/v1" ||
+			u.GetAPIVersion() == "sriovfec.intel.com/v2" || // it's optional?!
+			u.GetObjectKind().GroupVersionKind().Kind == "Secret" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "Namespace" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "MachineConfigPool" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "ServiceAccount" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "Node" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "PlacementBinding" ||
+			u.GetObjectKind().GroupVersionKind().Kind == "PlacementRule" {
+			continue
+		}
+
+		finalList = append(finalList, u)
+	}
+
+	return finalList
+}
+
+func removeDuplicates(uList []unstructured.Unstructured, removeDuplicate map[string]string, curFile string) []unstructured.Unstructured {
+	var finalList []unstructured.Unstructured
+
+	for _, curU := range uList {
+		key, _ := curU.MarshalJSON()
+
+		if seenBeforeFilePath, seenBefore := removeDuplicate[string(key)]; seenBefore {
+			msg := fmt.Sprintf("previously seen full or partial content of %s in %s", curFile, seenBeforeFilePath)
+			slog.Warn(msg)
+
+			continue
+		}
+
+		removeDuplicate[string(key)] = curFile
+
+		finalList = append(finalList, curU)
 	}
 
 	return finalList
@@ -392,7 +472,7 @@ func getObjectTemplates(p policyv1.Policy) []unstructured.Unstructured {
 	return objT
 }
 
-func equalUnstructuredList(setA []unstructured.Unstructured, setB []unstructured.Unstructured) bool {
+func contentExactMatch(setA []unstructured.Unstructured, setB []unstructured.Unstructured) bool {
 	mapA := make(map[string]string, len(setA))
 
 	for _, a := range setA {

@@ -26,9 +26,7 @@ func GetFileNames(dir string) ([]string, error) {
 		}
 
 		if !info.IsDir() {
-			if filepath.Ext(info.Name()) == ".yaml" {
-				files = append(files, path)
-			}
+			files = append(files, path)
 		}
 
 		return nil
